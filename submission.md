@@ -1,4 +1,24 @@
-# Mixtape Codebase Map
+# Mixtape Submission
+
+## AI Usage
+
+I used an AI coding assistant (Claude) throughout this project as a pair-programmer and explainer. Being honest about what it did well and where I had to push back:
+
+**What I asked it to explain or trace:**
+- **Codebase map.** I had it read every non-test `.py` file and summarize each module's responsibility and the request→service→DB data flow (e.g. how adding a song to a playlist writes a `Notification`). I verified the claims by reading the files it cited rather than trusting the summary — the map matched the code.
+- **Line-level explanations.** I asked it to explain specific fragments I wasn't sure about: the three-branch streak `if/elif/else`, and the list comprehension `[song.to_dict() for song in songs[:-1]]`. The `[:-1]` explanation ("all but the last element") is what made the dropped-last-song bug obvious.
+- **The Sunday streak condition.** It correctly identified that `today.weekday() != 6` means Sunday (`weekday()==6`) always falls through to the reset branch. I confirmed the fix by running `test_streak_increments_on_sunday` before and after.
+
+**Where I had to verify myself or the AI was incomplete/wrong:**
+- **The environment error.** The `ModuleNotFoundError: No module named 'flask_sqlalchemy'` turned out to be a Python-version mismatch (system 3.9 vs venv 3.14), not a missing package. The fix was running Flask through the venv, which took a couple of tries to pin down.
+- **Reproducing the duplicate-search bug (Issue 3).** This is the clearest case where the AI's first framing was misleading. It initially treated the duplicate as reproducible, and I burned real time trying to trigger it: seeding a "Stairway" song that went to the wrong database, curling `?q=Crown Heights` and repeatedly getting `count: 1`, and checking `seed_data.py`. Only after direct testing did we establish the bug is **latent** — the `outerjoin` genuinely fans a multi-tag song into multiple rows, but the legacy `Query.all()` API auto-deduplicates by primary key, so it never surfaces with the current code. The AI had to prove this by running the same query three ways (legacy `Query`, raw columns, 2.0 `select().scalars()`); only the last two showed the duplicate. I insisted on confirming against the *actual running code* rather than a throwaway script, and the honest conclusion — "current code cannot replicate it" — only came after I pushed on that.
+- **Regression-test verification.** I did not accept "19 tests pass" as proof the tests were meaningful. I had the fixes reverted and re-ran the new tests to confirm they actually **fail on the buggy code**. That step caught a real problem: the environment auto-commits after edits, and an auto-commit fired mid-verification while the feed threshold was reverted to 24h, committing the buggy value. I had to spot that in `git reflog`, understand the auto-commit behavior, and commit a correction so HEAD ended up consistent.
+
+**Overall:** AI was fastest at reading unfamiliar code, explaining syntax, and drafting the root-cause writeups. It was least reliable when a bug's *observable* behavior didn't match its intuition (Issue 3) — there I had to force reproduction against the real app and DB before trusting any conclusion. Every fix in this doc was confirmed by running the test suite, not by the AI's say-so.
+
+---
+
+## Codebase Map
 
 ## Main Files
 
