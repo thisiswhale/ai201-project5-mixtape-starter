@@ -141,4 +141,22 @@ Both interactions route through `services/notification_service.py`, so I compare
 
 **Fix and side-effect check**
 
-After the commit in `rate_song`, added the same guard the playlist path uses — `if song.shared_by != user_id:` — and a `create_notification` call with type `"song_rated"` and a body naming the rater, song, and score (e.g. `"alice rated your song 'Bohemian Rhapsody' 4/5."`). The self-rating guard prevents a user from notifying themselves. Per the requirement, this fires on every rate, including score updates, not just the first rating. Ran the full suite afterward: all streak and search tests pass; the only failures are the pre-existing, unrelated `songs[:-1]` playlist bug, which this change does not touch.
+After the commit in `rate_song`, added the same guard the playlist path uses — `if song.shared_by != user_id:` — and a `create_notification` call with type `"song_rated"` and a body naming the rater, song, and score (e.g. `"alice rated your song 'Bohemian Rhapsody' 4/5."`). The self-rating guard prevents a user from notifying themselves. Per the requirement, this fires on every rate, including score updates, not just the first rating. Ran the full suite afterward: all streak and search tests pass; the only failures are the pre-existing, unrelated `songs[:-1]` playlist bug (fixed separately below), which this change does not touch.
+
+### Bug 5: Playlist song list silently drops the last song
+
+**How I reproduced it**
+
+`GET /playlists/<id>/songs` (and the underlying `get_playlist_songs`) should return every song in the playlist. The two playlist tests exercised this directly: `test_playlist_returns_all_songs` seeds a 5-song playlist and asserts `len(songs) == 5`; `test_playlist_returns_songs_in_order` asserts the titles are `["Track 1" … "Track 5"]`. Both failed — the function returned 4 songs (`["Track 1" … "Track 4"]`), dropping `Track 5`. Every non-empty playlist was one song short.
+
+**How I found the root cause**
+
+Opened `services/playlist_service.py` and read `get_playlist_songs`. The query itself is correct — it joins `Song` to `playlist_entries`, filters by `playlist_id`, and orders ascending by `position`, so `songs` holds the full ordered list. The defect is on the return line (line 66): `return [song.to_dict() for song in songs[:-1]]`. The `[:-1]` slice was the smoking gun — it excludes the final element of the list before serializing.
+
+**The root cause**
+
+The return statement slices the query results with `songs[:-1]`, which means "all songs except the last one." `[:-1]` in Python drops the final list element. So a correctly-ordered, complete query result had its last (highest-`position`) song thrown away at the very end. The query fetched all N songs; the comprehension serialized only the first N−1. An empty playlist happened to still work (`[][:-1]` is `[]`), which is why only the non-empty cases failed.
+
+**Fix and side-effect check**
+
+Changed `songs[:-1]` to `songs` so the comprehension iterates the complete result: `return [song.to_dict() for song in songs]`. The ordering and filtering were already correct and were left untouched. Ran the full test suite afterward — all 13 tests pass, including both previously-failing playlist tests and the empty-playlist case, confirming the fix restores the dropped song without breaking ordering or the empty-list path.
