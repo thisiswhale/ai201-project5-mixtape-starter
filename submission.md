@@ -123,4 +123,22 @@ The `outerjoin` on the `song_tags` association table multiplies each song row by
 
 **Fix and side-effect check**
 
-No code change was required to pass the existing tests, but the defensive fix is to make the dedup explicit rather than rely on the legacy API: add `.distinct()` to the query (`db.session.query(Song).outerjoin(...).filter(...).distinct().all()`), or `.unique()` if migrated to the 2.0 `select` form. That guarantees one row per song regardless of tag count or API style. Verified the current behavior is already correct — `curl` returns `count: 1` for the 3-tag song and all five search tests pass — so leaving the query as-is is safe for now; the note documents the latent risk for whoever touches this query next.
+Added `.distinct()` to the query (`db.session.query(Song).outerjoin(...).filter(...).distinct().all()`) so the dedup is explicit rather than relying on the legacy API's identity-map behavior. This guarantees one row per song regardless of tag count and survives a future migration to the 2.0 `select().scalars().all()` form (which would otherwise need `.unique()`). Re-ran all five search tests after the change: all pass, including the multi-tag, single-tag, and no-tag no-duplicate cases. No other query relies on this function, so nothing downstream changes.
+
+### Bug 4: No notification sent when a friend rates your shared song
+
+**How I reproduced it**
+
+Two notification-triggering interactions exist: adding someone's song to a playlist, and rating someone's song. Adding a song to a playlist correctly produced a notification for the sharer. Rating the same song produced nothing — the sharer's inbox (`GET /users/<id>/notifications`) stayed empty after another user hit `POST /songs/<id>/rate`, even though the rating itself was saved successfully (the endpoint returned `201` with the Rating body).
+
+**How I found the root cause**
+
+Both interactions route through `services/notification_service.py`, so I compared the two functions side by side. `add_to_playlist` (lines 35–70) ends with an `if song.shared_by != added_by_user_id:` guard that calls `create_notification(...)`. `rate_song` (lines 73–110) has all the same ingredients — it loads the `song` and the `rater`, so it knows both `song.shared_by` and the rater's username — but after `db.session.commit()` it goes straight to `return rating`. There is no `create_notification` call anywhere in `rate_song`. That asymmetry between the two functions was the confirmation: the rating path simply never notifies.
+
+**The root cause**
+
+`rate_song` persists the `Rating` (insert or score update) and returns, but it omits the notification step entirely. Unlike `add_to_playlist`, it never calls `create_notification`, so the song's original sharer is never told their song was rated. The feature was half-implemented: the rating is stored, but the "notify the sharer" side effect that the playlist path has was never added to the rating path.
+
+**Fix and side-effect check**
+
+After the commit in `rate_song`, added the same guard the playlist path uses — `if song.shared_by != user_id:` — and a `create_notification` call with type `"song_rated"` and a body naming the rater, song, and score (e.g. `"alice rated your song 'Bohemian Rhapsody' 4/5."`). The self-rating guard prevents a user from notifying themselves. Per the requirement, this fires on every rate, including score updates, not just the first rating. Ran the full suite afterward: all streak and search tests pass; the only failures are the pre-existing, unrelated `songs[:-1]` playlist bug, which this change does not touch.
