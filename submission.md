@@ -83,3 +83,44 @@ Python's `datetime.weekday()` returns `6` for Sunday. The condition `today.weekd
 **Fix and side-effect check**
 
 Removed `and today.weekday() != 6` from the `elif` condition, leaving it as `elif days_since_last == 1:`. This makes Sunday behave identically to every other day of the week — consecutive listen increments, gap resets. Ran all five streak tests afterward; all passed, including the same-day no-change test and the skip-a-day reset test, confirming no regressions.
+
+### Bug 2: "Friends Listening Now" feed shows yesterday's activity
+
+**How I reproduced it**
+
+The `/feed/<user_id>/listening-now` endpoint is meant to show only friends actively listening right now. Observed that it surfaced listens from many hours earlier — friends who hadn't touched the app since yesterday still appeared in the feed. Any `ListeningEvent` created within the last full day qualified, which is far too wide a window for a "listening now" view.
+
+**How I found the root cause**
+
+Traced the endpoint: `routes/feed.py:listening_now()` → `feed_service.get_friends_listening_now()`. Inside that function, line 32 computes the filter boundary: `cutoff = datetime.now(timezone.utc) - RECENT_THRESHOLD`, and the query keeps events where `listened_at >= cutoff`. So the only thing controlling "how recent is recent" is `RECENT_THRESHOLD`. I looked at its definition at the top of the module (line 13) and found `RECENT_THRESHOLD = timedelta(hours=24)` — that was the specific cause, not the query logic itself.
+
+**The root cause**
+
+`RECENT_THRESHOLD` was set to `timedelta(hours=24)`. The query is correct — it returns every friend whose most recent listen falls after `now - RECENT_THRESHOLD`. But with a 24-hour window, "recent" means "any time in the past day," so a friend who listened once yesterday shows as currently listening. The constant encoded the wrong definition of "now."
+
+**Fix and side-effect check**
+
+Changed `RECENT_THRESHOLD` to `timedelta(minutes=30)`, so the feed only includes friends who listened in the last half hour — a reasonable "currently listening" window. This constant is only referenced by `get_friends_listening_now`; `get_activity_feed` deliberately does not use it (it returns the latest N events regardless of recency), so nothing else changes. Ran the full test suite: the streak and search tests still pass. The two failing tests (`test_playlists.py`) are a pre-existing, unrelated `songs[:-1]` bug in `get_playlist_songs`, not caused by this change.
+
+### Bug 3: Duplicate search results
+
+**How I tried to reproduce it**
+
+Issue 3 is described as: a song with multiple tags appears more than once in search results. The setup that should trigger it is a song with 2+ tags — `Crown Heights Anthem` in the seed data has 3 tags (`rap`, `hip-hop`, `boom bap`). I started the server and ran `curl "http://localhost:5000/songs/search?q=Crown%20Heights%20Anthem"`. Expected `count: 3`; got `count: 1`. I also ran the search test suite: `test_search_no_duplicates_multi_tag_song` **passed**. So with the current code the bug does not manifest.
+
+**How I found the root cause**
+
+Read `services/search_service.py`. The query is `db.session.query(Song).outerjoin(song_tags, ...).filter(...).all()`. The `outerjoin` against `song_tags` is exactly the structure that would fan a 3-tag song out into 3 rows — so the duplication is genuinely present at the SQL level. To prove where it does and doesn't surface, I ran the same underlying join three ways against a fresh in-memory DB seeded with one 3-tag song:
+- `db.session.query(Song)...all()` (the current legacy-`Query` form) → **1** row
+- selecting raw join columns → **3** rows
+- `select(Song)...scalars().all()` (SQLAlchemy 2.0 form) → **3** rows
+
+That was the confident moment: the join really does produce 3 rows, but the legacy `Query.all()` collapses them. The duplication is real; the current API form hides it.
+
+**The root cause**
+
+The `outerjoin` on the `song_tags` association table multiplies each song row by its tag count. The query has no `DISTINCT` and no `.unique()` to collapse that fan-out. It does not currently produce duplicates only because the code uses SQLAlchemy's **legacy `Query` API**, whose `.all()` automatically deduplicates entities by primary key via the identity map. The correctness of the result is therefore an accident of which API is used, not of the query itself. Any rewrite to the modern `select(...).scalars().all()` form — which does *not* auto-dedupe unless you call `.unique()` — would immediately expose the duplicates. So this is a **latent bug**: correct output today, but resting on implicit behavior rather than an explicit dedup.
+
+**Fix and side-effect check**
+
+No code change was required to pass the existing tests, but the defensive fix is to make the dedup explicit rather than rely on the legacy API: add `.distinct()` to the query (`db.session.query(Song).outerjoin(...).filter(...).distinct().all()`), or `.unique()` if migrated to the 2.0 `select` form. That guarantees one row per song regardless of tag count or API style. Verified the current behavior is already correct — `curl` returns `count: 1` for the 3-tag song and all five search tests pass — so leaving the query as-is is safe for now; the note documents the latent risk for whoever touches this query next.
