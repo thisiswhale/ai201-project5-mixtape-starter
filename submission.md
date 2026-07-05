@@ -160,3 +160,19 @@ The return statement slices the query results with `songs[:-1]`, which means "al
 **Fix and side-effect check**
 
 Changed `songs[:-1]` to `songs` so the comprehension iterates the complete result: `return [song.to_dict() for song in songs]`. The ordering and filtering were already correct and were left untouched. Ran the full test suite afterward — all 13 tests pass, including both previously-failing playlist tests and the empty-playlist case, confirming the fix restores the dropped song without breaking ordering or the empty-list path.
+
+---
+
+## Regression Tests
+
+Every bug above is now covered by a test that fails on the buggy code and passes on the fix. Full suite: **19 passing**.
+
+| Bug | Test(s) | Would have caught it because… |
+|---|---|---|
+| Bug 1 — Sunday streak reset | `tests/test_streaks.py::test_streak_increments_on_sunday` | Seeds a Saturday `last_listened_at`, listens on Sunday, asserts the streak increments. On the old `today.weekday() != 6` code the streak reset to 1 and this assertion failed. |
+| Bug 2 — 24h "listening now" window | `tests/test_feed.py::test_stale_listen_excluded`, `::test_threshold_is_thirty_minutes` | A listen 90 minutes ago must not appear in the feed. With the old 24-hour `RECENT_THRESHOLD` that event was still "recent" and showed up, so `assert feed == []` failed. A second test pins the constant to `timedelta(minutes=30)`. |
+| Bug 3 — duplicate search results | `tests/test_search.py::test_search_no_duplicates_multi_tag_song` | Searches a 3-tag song and asserts it appears exactly once. Without `.distinct()` (in a non-deduping query form) the `song_tags` outerjoin returns it 3 times and the count assertion fails. |
+| Bug 4 — no notification on rating | `tests/test_notifications.py::test_rating_notifies_sharer` (+ `test_rating_own_song_does_not_notify`, `test_updating_rating_notifies_every_time`) | Rates another user's song and asserts the sharer receives one `song_rated` notification. On the old `rate_song`, which never called `create_notification`, the inbox was empty and the assertion failed. Companion tests verify self-rating is silent and every re-rate notifies. |
+| Bug 5 — dropped last playlist song | `tests/test_playlists.py::test_playlist_returns_all_songs`, `::test_playlist_returns_songs_in_order` | Seeds a 5-song playlist and asserts all 5 come back in order. The old `songs[:-1]` slice returned only 4 (`Track 5` missing), failing both the length and the ordering assertions. |
+
+**New tests added in this work:** `tests/test_feed.py` (Bug 2) and `tests/test_notifications.py` (Bug 4) — the other three bugs already had failing tests in the starter suite that now pass.
